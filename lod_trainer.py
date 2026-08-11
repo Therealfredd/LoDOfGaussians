@@ -266,23 +266,68 @@ def find_cuda_toolkits():
                   reverse=True)
 
 
-def torch_index_for_cuda(cuda_version):
-    """Map a CUDA toolkit version onto a PyTorch wheel index."""
+# CUDA versions PyTorch publishes wheels for, oldest first.
+TORCH_WHEEL_CUDA = [(11, 8), (12, 1), (12, 4), (12, 6), (12, 8), (12, 9),
+                    (13, 0), (13, 2)]
+
+
+def parse_cuda_version(cuda_version):
     try:
-        major, minor = (int(x) for x in cuda_version.split(".")[:2])
-    except ValueError:
-        return "cu124"
-    if major >= 13:
-        return "cu128"
-    if major == 12:
-        if minor >= 8:
-            return "cu128"
-        if minor >= 6:
-            return "cu126"
-        if minor >= 4:
-            return "cu124"
-        return "cu121"
-    return "cu118"
+        major, minor = (int(x) for x in str(cuda_version).split(".")[:2])
+        return major, minor
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def torch_index_for_cuda(cuda_version):
+    """
+    Map an installed CUDA toolkit onto a PyTorch wheel index.
+
+    PyTorch refuses to build extensions when the toolkit's MAJOR version differs
+    from the one it was built against (a minor difference is only a warning), so
+    this never crosses majors. Prefer an exact match, then the newest wheel of
+    the same major that is no newer than the toolkit. Returns None when PyTorch
+    ships nothing for that major.
+    """
+    parsed = parse_cuda_version(cuda_version)
+    if parsed is None:
+        return None
+    major, minor = parsed
+    same_major = [v for v in TORCH_WHEEL_CUDA if v[0] == major]
+    if not same_major:
+        return None
+    if (major, minor) in same_major:
+        pick = (major, minor)
+    else:
+        not_newer = [v for v in same_major if v[1] <= minor]
+        pick = not_newer[-1] if not_newer else same_major[0]
+    return f"cu{pick[0]}{pick[1]}"
+
+
+def cuda_match_quality(cuda_version):
+    """0 = exact wheel, 1 = same major only, 2 = no wheel at all."""
+    tag = torch_index_for_cuda(cuda_version)
+    if tag is None:
+        return 2
+    parsed = parse_cuda_version(cuda_version)
+    return 0 if parsed in TORCH_WHEEL_CUDA else 1
+
+
+def best_cuda_index(cudas):
+    """
+    Pick which installed toolkit to build against: exact PyTorch wheel match
+    first, newest as the tie-break. Blindly taking the newest toolkit is what
+    pairs a CUDA 13 toolkit with a CUDA 12 wheel and fails the build.
+    """
+    if not cudas:
+        return -1
+    best, best_key = 0, None
+    for i, (version, _) in enumerate(cudas):
+        parsed = parse_cuda_version(version) or (0, 0)
+        key = (cuda_match_quality(version), -parsed[0], -parsed[1])
+        if best_key is None or key < best_key:
+            best, best_key = i, key
+    return best
 
 
 def find_vs_build_env():
@@ -325,6 +370,36 @@ def needs_unsupported_compiler_flag(cuda_version, toolset):
     if (tmaj, tmin) < (14, 40):
         return False
     return (cmaj, cmin) < (12, 6)
+
+
+def probe_nvcc_host_compiler(cuda_root, env):
+    """
+    Compile a trivial .cu to find out whether nvcc accepts the installed MSVC.
+    Returns (works, needs_flag). Guessing from version numbers cannot keep up
+    with new CUDA/MSVC releases, so ask the compiler itself.
+    """
+    if os.name != "nt" or not cuda_root:
+        return True, False
+    nvcc = Path(cuda_root) / "bin" / "nvcc.exe"
+    if not nvcc.exists():
+        return True, False
+    tmp = Path(os.environ.get("TEMP", ".")) / f"lodtrainer_nvcc_{os.getpid()}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    src = tmp / "probe.cu"
+    src.write_text("__global__ void k() {}\n", encoding="utf-8")
+    try:
+        for flags in ([], ["-allow-unsupported-compiler"]):
+            rc, out = _run_capture(
+                [str(nvcc), *flags, "-c", str(src), "-o", str(tmp / "probe.obj")],
+                cwd=str(tmp), env=env)
+            if rc == 0:
+                return True, bool(flags)
+            if "unsupported Microsoft Visual Studio version" not in out:
+                # Failing for some other reason; the flag will not help.
+                return False, False
+        return False, True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def detect_gpu():
@@ -862,9 +937,47 @@ class Installer:
                            str(max(1, min(8, (os.cpu_count() or 4) // 2))))
             return env
 
+        def probe_env_for(root):
+            env = dict(os.environ)
+            env.update(vc)
+            env["PATH"] = str(Path(root) / "bin") + os.pathsep + env.get("PATH", "")
+            return env
+
+        # Ask nvcc directly whether it accepts this MSVC, rather than guessing
+        # from version numbers - the answer changes with every CUDA release.
+        if os.name == "nt" and cuda_root:
+            self.r.log("Checking whether nvcc accepts the installed MSVC...",
+                       "step")
+            works, needs_flag = probe_nvcc_host_compiler(cuda_root,
+                                                         probe_env_for(cuda_root))
+            if works and needs_flag:
+                self.opts["allow_unsupported"] = True
+                self.r.log("  MSVC is newer than this CUDA expects; enabling "
+                           "-allow-unsupported-compiler.", "warn")
+            elif works:
+                self.r.log("  nvcc and MSVC are compatible.", "ok")
+            else:
+                # A trivial kernel will not compile, so nothing else will
+                # either. Point at a toolkit that does before wasting a build.
+                alt = None
+                for version, root in (self.opts.get("all_cuda") or []):
+                    if root == cuda_root:
+                        continue
+                    if torch_index_for_cuda(version) is None:
+                        continue
+                    ok_alt, _ = probe_nvcc_host_compiler(root, probe_env_for(root))
+                    if ok_alt:
+                        alt = version
+                        break
+                hint = (f"CUDA {alt} works with this compiler - select it on the "
+                        f"Setup tab." if alt else
+                        "Install a newer CUDA toolkit, or an older MSVC toolset.")
+                return self._fail(
+                    f"CUDA {self.opts.get('cuda_version')} cannot compile with "
+                    f"MSVC {self.opts.get('toolset')}.\n    {hint}")
+
         if self.opts.get("allow_unsupported"):
-            self.r.log("  Using -allow-unsupported-compiler "
-                       "(CUDA/MSVC version mismatch).", "warn")
+            self.r.log("  Using -allow-unsupported-compiler.", "warn")
 
         self.build_env = make(True)
         # The Visual Studio CMake generator fails to identify the C++ compiler
@@ -930,7 +1043,40 @@ class Installer:
         self.r.run([str(vpy), "-m", "pip", "install", "cmake"], check=False)
         return True
 
+    def check_cuda_torch_match(self):
+        """
+        torch.utils.cpp_extension raises outright when the toolkit's major CUDA
+        version differs from the one PyTorch was built with. Catch it here, with
+        a message that names the fix, instead of 60 lines of pip traceback.
+        """
+        vpy = venv_python()
+        rc, out = _run_capture([str(vpy), "-c",
+                                "import torch; print(torch.version.cuda or '')"])
+        torch_cuda = out.strip().splitlines()[-1].strip() if rc == 0 and out.strip() else ""
+        selected = self.opts.get("cuda_version")
+        if not torch_cuda or not selected:
+            return True
+        t_major = torch_cuda.split(".")[0]
+        s_major = str(selected).split(".")[0]
+        self.r.log(f"  building against CUDA {selected}; "
+                   f"PyTorch was built with CUDA {torch_cuda}.", "info")
+        if t_major == s_major:
+            return True
+
+        alternatives = [v for v, _ in (self.opts.get("all_cuda") or [])
+                        if v.split(".")[0] == t_major]
+        hint = (f"Select CUDA {alternatives[0]} on the Setup tab and run setup "
+                f"again." if alternatives else
+                f"Install the CUDA {t_major}.x toolkit, or pick a different "
+                f"toolkit on the Setup tab.")
+        return self._fail(
+            f"CUDA {selected} cannot build extensions for a PyTorch built "
+            f"against CUDA {torch_cuda} - the major versions must match.\n"
+            f"    {hint}")
+
     def build_extensions(self):
+        if not self.check_cuda_torch_match():
+            return False
         vpy = venv_python()
         steps = [
             ("simple-knn", [str(vpy), "-m", "pip", "install",
@@ -947,9 +1093,11 @@ class Installer:
                 return False
             self.r.log(f"Building CUDA extension: {name} (this takes a while)...", "step")
             if self.r.run(cmd, env=self.build_env) != 0:
-                return self._fail(
-                    f"Failed to build {name}. Check that the CUDA toolkit and "
-                    f"MSVC versions above are compatible.")
+                extra = ("" if self.opts.get("allow_unsupported") else
+                         "\n    If the log mentions an unsupported Microsoft "
+                         "Visual Studio version, tick 'Allow unsupported host "
+                         "compiler' on the Setup tab and retry.")
+                return self._fail(f"Failed to build {name}.{extra}")
         return True
 
     def patch_gsplat(self):
@@ -1500,8 +1648,14 @@ class App(tk.Tk):
         self.env_tree.tag_configure("ok", foreground="#1d6f1d")
 
         if e["cuda"]:
-            self.cuda_combo["values"] = [f"CUDA {v}   ({p})" for v, p in e["cuda"]]
-            self.cuda_combo.current(0)
+            labels = []
+            for v, _ in e["cuda"]:
+                tag = torch_index_for_cuda(v)
+                note = {0: "exact match", 1: "same major",
+                        2: "no PyTorch wheel"}[cuda_match_quality(v)]
+                labels.append(f"CUDA {v}  ->  {tag or 'unsupported'}  ({note})")
+            self.cuda_combo["values"] = labels
+            self.cuda_combo.current(max(0, best_cuda_index(e["cuda"])))
             self._on_cuda_change()
         else:
             self.cuda_combo["values"] = []
@@ -1518,7 +1672,14 @@ class App(tk.Tk):
         if not version:
             return
         tag = torch_index_for_cuda(version)
-        self.torch_label.configure(text=f"-> PyTorch wheel: {tag}")
+        if tag is None:
+            self.torch_label.configure(
+                text="PyTorch ships no wheel for this CUDA major version")
+        else:
+            quality = cuda_match_quality(version)
+            self.torch_label.configure(
+                text=f"-> PyTorch {tag}" +
+                     ("" if quality == 0 else "  (minor mismatch, builds fine)"))
         need = needs_unsupported_compiler_flag(version, self.env_info.get("toolset"))
         self.allow_unsupported.set(need)
 
@@ -1654,7 +1815,7 @@ class App(tk.Tk):
             self.ds_status.insert("end", f"  - {msg}\n", tag)
         if fixable:
             self.ds_status.insert(
-                "end", "  -> Press 'Prepare dataset' to fix this.\n", "warn")
+                "end", "  -> Press 'Prep' to fix this.\n", "warn")
 
         # graph_view_select builds a k-NN graph over cameras; sklearn needs
         # strictly more images than neighbours.
@@ -1764,7 +1925,9 @@ class App(tk.Tk):
             "python": self.env_info.get("python"),
             "cuda_root": root,
             "cuda_version": version,
-            "torch_index": torch_index_for_cuda(version) if version else "cu124",
+            "all_cuda": self.env_info.get("cuda") or [],
+            "torch_index": (torch_index_for_cuda(version) if version else None)
+                           or "cu126",
             "vcvars": self.env_info.get("vcvars"),
             "toolset": self.env_info.get("toolset"),
             "arch": self.env_info.get("arch"),
@@ -1789,6 +1952,18 @@ class App(tk.Tk):
                     APP_NAME,
                     "No CUDA toolkit was detected. The CUDA extensions cannot be "
                     "compiled without it.\n\nContinue anyway?"):
+                return
+        else:
+            version, _ = self._selected_cuda()
+            if version and torch_index_for_cuda(version) is None:
+                usable = [v for v, _ in self.env_info["cuda"]
+                          if torch_index_for_cuda(v)]
+                messagebox.showerror(
+                    APP_NAME,
+                    f"PyTorch publishes no wheels for CUDA {version}.\n\n"
+                    + (f"Select CUDA {usable[0]} instead."
+                       if usable else
+                       "Install a CUDA 12.x or 13.x toolkit."))
                 return
         self._save_settings()
         self.nb.select(0)

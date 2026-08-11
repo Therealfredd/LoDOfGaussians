@@ -113,10 +113,19 @@ Python 3.10.
 
 Two things this launcher handles automatically that trip up a manual install:
 
-- **CUDA 12.4 rejects MSVC 14.41.** `nvcc` refuses host compilers newer than it
-  knows about, and CUDA ≤12.5 hard-fails on MSVC 14.40+. The *Allow unsupported
-  host compiler* box is ticked automatically when that mismatch is detected. The
-  cleaner fix is installing CUDA 12.6+, which supports this toolset properly.
+- **The CUDA toolkit must match the PyTorch build.** PyTorch refuses to compile
+  extensions when the toolkit's *major* CUDA version differs from the one it was
+  built against — a minor difference is only a warning. Setup picks the toolkit
+  with an exact wheel match, so a machine with both CUDA 13.2 and 12.8 installed
+  gets `cu132` against 13.2 rather than pairing 13.2 with a CUDA 12 wheel. The
+  dropdown shows the wheel each toolkit maps to, and setup refuses early with a
+  clear message rather than failing deep inside a pip build.
+- **`nvcc` rejects host compilers newer than it knows about.** Rather than guess
+  from version tables that go stale with every release, setup compiles a
+  throwaway kernel and asks the compiler: if it fails specifically on the
+  version check, `-allow-unsupported-compiler` is enabled automatically. If the
+  toolkit cannot compile at all — CUDA 11.x with a modern MSVC, say — setup
+  stops and names an installed toolkit that does work.
 - **The compiler environment is needed at training time, not just at install
   time.** `gsplat` compiles its kernels on first use, so the app runs training
   with the MSVC environment loaded — otherwise the first iteration dies looking
