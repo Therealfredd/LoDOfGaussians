@@ -120,12 +120,20 @@ Two things this launcher handles automatically that trip up a manual install:
   gets `cu132` against 13.2 rather than pairing 13.2 with a CUDA 12 wheel. The
   dropdown shows the wheel each toolkit maps to, and setup refuses early with a
   clear message rather than failing deep inside a pip build.
-- **`nvcc` rejects host compilers newer than it knows about.** Rather than guess
-  from version tables that go stale with every release, setup compiles a
-  throwaway kernel and asks the compiler: if it fails specifically on the
-  version check, `-allow-unsupported-compiler` is enabled automatically. If the
-  toolkit cannot compile at all — CUDA 11.x with a modern MSVC, say — setup
-  stops and names an installed toolkit that does work.
+- **nvcc and MSVC each reject the other's version, independently.** nvcc's
+  `crt/host_config.h` refuses an MSVC it doesn't recognise; MSVC's
+  `yvals_core.h` refuses an nvcc it doesn't recognise (*"STL1002: Unexpected
+  compiler version"*). They have different cures —
+  `-allow-unsupported-compiler` and `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`
+  — and which one fires depends on which side is newer. Version tables go stale
+  every release, so setup compiles a throwaway kernel and works up a ladder of
+  flag combinations until one succeeds, then uses exactly that set for the real
+  builds. On this machine that takes CUDA 11.8 from "will not compile at all"
+  to compiling cleanly against MSVC 14.41.
+
+  This check is **advisory**: if the probe fails for some unrelated reason it
+  prints what the compiler actually said, applies the flags as a precaution and
+  carries on, rather than blocking a build that might have worked.
 - **The compiler environment is needed at training time, not just at install
   time.** `gsplat` compiles its kernels on first use, so the app runs training
   with the MSVC environment loaded — otherwise the first iteration dies looking

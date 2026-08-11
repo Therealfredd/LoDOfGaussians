@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -204,15 +205,15 @@ PRESETS = {
 # environment probing
 # --------------------------------------------------------------------------
 
-def _run_capture(cmd, **kwargs):
+def _run_capture(cmd, timeout=120, **kwargs):
     """Run a command, return (returncode, combined output). Never raises."""
     try:
         p = subprocess.run(
             cmd, capture_output=True, text=True, errors="replace",
-            creationflags=CREATE_NO_WINDOW, timeout=120, **kwargs)
+            creationflags=CREATE_NO_WINDOW, timeout=timeout, **kwargs)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
     except Exception as exc:  # noqa: BLE001 - probing must never be fatal
-        return 1, str(exc)
+        return 1, f"{type(exc).__name__}: {exc}"
 
 
 def find_python310():
@@ -372,32 +373,49 @@ def needs_unsupported_compiler_flag(cuda_version, toolset):
     return (cmaj, cmin) < (12, 6)
 
 
+# nvcc and MSVC guard each other's versions independently:
+#   nvcc's crt/host_config.h rejects an unknown MSVC ("unsupported Microsoft
+#     Visual Studio version") - cured by -allow-unsupported-compiler
+#   MSVC's yvals_core.h rejects an unknown nvcc ("STL1002: Unexpected compiler
+#     version") - cured by _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+# Either can fire depending on which side is newer, so try them in turn.
+NVCC_FLAG_LADDER = [
+    [],
+    ["-allow-unsupported-compiler"],
+    ["-allow-unsupported-compiler", "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"],
+    ["-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"],
+]
+
+
 def probe_nvcc_host_compiler(cuda_root, env):
     """
-    Compile a trivial .cu to find out whether nvcc accepts the installed MSVC.
-    Returns (works, needs_flag). Guessing from version numbers cannot keep up
-    with new CUDA/MSVC releases, so ask the compiler itself.
+    Compile a trivial .cu to find the flags nvcc needs to accept the installed
+    MSVC. Version tables cannot keep up with new CUDA/MSVC releases, so ask the
+    compilers themselves.
+
+    Returns (works, flags, detail); detail is the output of the last failure.
+    Advisory only - a probe that fails for an unrelated reason must never block
+    a build that would have succeeded.
     """
     if os.name != "nt" or not cuda_root:
-        return True, False
+        return True, [], ""
     nvcc = Path(cuda_root) / "bin" / "nvcc.exe"
     if not nvcc.exists():
-        return True, False
-    tmp = Path(os.environ.get("TEMP", ".")) / f"lodtrainer_nvcc_{os.getpid()}"
-    tmp.mkdir(parents=True, exist_ok=True)
+        return True, [], f"nvcc not found at {nvcc}"
+    tmp = Path(tempfile.mkdtemp(prefix="lodtrainer_nvcc_"))
     src = tmp / "probe.cu"
-    src.write_text("__global__ void k() {}\n", encoding="utf-8")
+    src.write_text("#include <cuda_runtime.h>\n__global__ void k() {}\n",
+                   encoding="utf-8")
+    detail = ""
     try:
-        for flags in ([], ["-allow-unsupported-compiler"]):
+        for flags in NVCC_FLAG_LADDER:
             rc, out = _run_capture(
                 [str(nvcc), *flags, "-c", str(src), "-o", str(tmp / "probe.obj")],
-                cwd=str(tmp), env=env)
+                cwd=str(tmp), env=env, timeout=300)
             if rc == 0:
-                return True, bool(flags)
-            if "unsupported Microsoft Visual Studio version" not in out:
-                # Failing for some other reason; the flag will not help.
-                return False, False
-        return False, True
+                return True, list(flags), ""
+            detail = out
+        return False, [], detail
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -930,8 +948,12 @@ class Installer:
             env["TORCH_EXTENSIONS_DIR"] = str(TORCH_EXT_DIR)
             if arch:
                 env["TORCH_CUDA_ARCH_LIST"] = arch
-            if self.opts.get("allow_unsupported"):
-                env["NVCC_PREPEND_FLAGS"] = "-allow-unsupported-compiler"
+            nvcc_flags = list(self.opts.get("nvcc_flags") or [])
+            if self.opts.get("allow_unsupported") and \
+                    "-allow-unsupported-compiler" not in nvcc_flags:
+                nvcc_flags.insert(0, "-allow-unsupported-compiler")
+            if nvcc_flags:
+                env["NVCC_PREPEND_FLAGS"] = " ".join(nvcc_flags)
             # Parallel compile without swamping the machine.
             env.setdefault("MAX_JOBS",
                            str(max(1, min(8, (os.cpu_count() or 4) // 2))))
@@ -945,39 +967,38 @@ class Installer:
 
         # Ask nvcc directly whether it accepts this MSVC, rather than guessing
         # from version numbers - the answer changes with every CUDA release.
+        # This is advisory: a probe can fail for reasons that will not affect
+        # the real build, so it never stops setup.
         if os.name == "nt" and cuda_root:
             self.r.log("Checking whether nvcc accepts the installed MSVC...",
                        "step")
-            works, needs_flag = probe_nvcc_host_compiler(cuda_root,
-                                                         probe_env_for(cuda_root))
-            if works and needs_flag:
-                self.opts["allow_unsupported"] = True
-                self.r.log("  MSVC is newer than this CUDA expects; enabling "
-                           "-allow-unsupported-compiler.", "warn")
+            works, flags, detail = probe_nvcc_host_compiler(
+                cuda_root, probe_env_for(cuda_root))
+            if works and flags:
+                self.opts["nvcc_flags"] = flags
+                self.r.log(f"  Compiles with: {' '.join(flags)}", "warn")
             elif works:
                 self.r.log("  nvcc and MSVC are compatible.", "ok")
             else:
-                # A trivial kernel will not compile, so nothing else will
-                # either. Point at a toolkit that does before wasting a build.
-                alt = None
-                for version, root in (self.opts.get("all_cuda") or []):
-                    if root == cuda_root:
-                        continue
-                    if torch_index_for_cuda(version) is None:
-                        continue
-                    ok_alt, _ = probe_nvcc_host_compiler(root, probe_env_for(root))
-                    if ok_alt:
-                        alt = version
-                        break
-                hint = (f"CUDA {alt} works with this compiler - select it on the "
-                        f"Setup tab." if alt else
-                        "Install a newer CUDA toolkit, or an older MSVC toolset.")
-                return self._fail(
-                    f"CUDA {self.opts.get('cuda_version')} cannot compile with "
-                    f"MSVC {self.opts.get('toolset')}.\n    {hint}")
+                self.r.log("  Test compile failed. Continuing anyway - this "
+                           "check is advisory. The compiler said:", "warn")
+                for line in [l for l in detail.splitlines() if l.strip()][:8]:
+                    self.r.log(f"    {line[:200]}", "dim")
+                # Best effort: these flags are harmless when unnecessary and
+                # are the usual cure when either side rejects the other.
+                self.opts["nvcc_flags"] = NVCC_FLAG_LADDER[-2]
+                self.r.log(f"    applying {' '.join(NVCC_FLAG_LADDER[-2])} "
+                           f"as a precaution.", "warn")
+                others = [v for v, _ in (self.opts.get("all_cuda") or [])
+                          if v != self.opts.get("cuda_version")
+                          and torch_index_for_cuda(v)]
+                if others:
+                    self.r.log(f"    if the build fails, try CUDA "
+                               f"{', '.join(others)} on the Setup tab.", "dim")
 
-        if self.opts.get("allow_unsupported"):
-            self.r.log("  Using -allow-unsupported-compiler.", "warn")
+        if self.opts.get("allow_unsupported") and not self.opts.get("nvcc_flags"):
+            self.r.log("  Using -allow-unsupported-compiler (from Setup tab).",
+                       "warn")
 
         self.build_env = make(True)
         # The Visual Studio CMake generator fails to identify the C++ compiler
