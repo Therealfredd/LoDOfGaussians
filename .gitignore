@@ -1,0 +1,30 @@
+# Created by setup - cloned upstream source, ~120 MB
+/repo/
+
+# Created by setup - isolated Python environment, several GB
+/venv/
+
+# Created by setup - JIT-compiled CUDA kernels
+/torch_extensions/
+
+# Local datasets and training output (very large)
+/test/
+*.dhier
+*.gdf
+*.ply
+
+# Saved UI state, specific to one machine
+settings.json
+
+# Editor / tooling
+.claude/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
