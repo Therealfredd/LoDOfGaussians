@@ -166,9 +166,20 @@ idempotent — re-running setup will not double-apply them.
   locate the toolchain itself. So the CUDA extension builds get the vcvars
   environment and the CMake step deliberately does not.
 
-It also sets `TORCH_CUDA_ARCH_LIST` to your GPU's compute capability (8.6 here),
-which cuts build time substantially, and clones with `core.longpaths` enabled
-because the bundled Eigen sources exceed Windows' 260-character path limit.
+- **The bundled CMakeLists pins `CUDA_ARCHITECTURES "70;75;86"`.** CUDA 13
+  dropped sm_70 outright (*"Unsupported gpu architecture 'compute_70'"*), and
+  that list covers nothing newer than Ampere — so on a current card the
+  hierarchy tool would not run even if it built. Setup retargets it at your
+  actual GPU, which also makes the build faster.
+- **`ninja` must be findable, not merely installed.** Running the venv's python
+  by absolute path does not put its `Scripts` directory on `PATH`, and torch's
+  JIT builder shells out to a bare `ninja` — so it fails with *"Ninja is
+  required to load C++ extensions"* even with ninja sitting in the venv. Setup
+  installs ninja and puts the venv's `Scripts` first on `PATH`.
+
+It also sets `TORCH_CUDA_ARCH_LIST` to your GPU's compute capability, which cuts
+build time substantially, and clones with `core.longpaths` enabled because the
+bundled Eigen sources exceed Windows' 260-character path limit.
 
 Installed and verified on this machine: torch 2.6.0+cu124, `gsplat`,
 `simple_knn`, `gaussian_hierarchy`, `fused_ssim`, and

@@ -962,11 +962,16 @@ class Installer:
 
         def make(with_vcvars):
             env = dict(vc) if with_vcvars else {}
+            base_path = env.get("PATH", os.environ.get("PATH", ""))
+            # The venv's Scripts directory must come first: running its python
+            # by absolute path does not put console scripts on PATH, and
+            # torch's JIT builder shells out to a bare `ninja`.
+            parts = [str(venv_python().parent)]
             if cuda_root:
                 env["CUDA_HOME"] = cuda_root
                 env["CUDA_PATH"] = cuda_root
-                env["PATH"] = str(Path(cuda_root) / "bin") + os.pathsep + \
-                    env.get("PATH", os.environ.get("PATH", ""))
+                parts.append(str(Path(cuda_root) / "bin"))
+            env["PATH"] = os.pathsep.join(parts + [base_path])
             # MSVC + setuptools on Windows.
             env["DISTUTILS_USE_SDK"] = "1"
             TORCH_EXT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1090,8 +1095,10 @@ class Installer:
         if self.opts.get("extras"):
             self.r.log("Installing optional extras...", "step")
             self.r.run([str(vpy), "-m", "pip", "install", *EXTRA_PACKAGES], check=False)
-        # cmake as a wheel avoids a separate system install.
-        self.r.run([str(vpy), "-m", "pip", "install", "cmake"], check=False)
+        # cmake and ninja as wheels avoid separate system installs; torch's JIT
+        # builder requires ninja and will not fall back without it.
+        self.r.run([str(vpy), "-m", "pip", "install", "cmake", "ninja"],
+                   check=False)
         return True
 
     def check_cuda_torch_match(self):
@@ -1236,8 +1243,41 @@ class Installer:
         self.r.log("  Patched view graph parser for standard COLMAP files.", "ok")
         return True
 
+    def patch_hierarchy_cmake(self):
+        """
+        The bundled CMakeLists pins CUDA_ARCHITECTURES to "70;75;86". CUDA 13
+        dropped sm_70 entirely ("Unsupported gpu architecture 'compute_70'"),
+        and the list covers nothing newer than Ampere, so on a current card the
+        binary would not run even if it built. Retarget it at the actual GPU.
+        """
+        arch = (self.opts.get("arch") or "").replace(".", "")
+        if not arch:
+            return True
+        cml = REPO_DIR / "submodules" / "gaussianhierarchy" / "CMakeLists.txt"
+        if not cml.exists():
+            return True
+        text = cml.read_text(encoding="utf-8")
+        m = re.search(r'CUDA_ARCHITECTURES\s+"([^"]*)"', text)
+        if not m:
+            self.r.log("  No CUDA_ARCHITECTURES line to patch.", "warn")
+            return True
+        if m.group(1) == arch:
+            self.r.log("  CMake CUDA architectures already match this GPU.", "ok")
+            return True
+        backup = cml.with_name(cml.name + ".original")
+        if not backup.exists():
+            shutil.copy2(cml, backup)
+        cml.write_text(text[:m.start(1)] + arch + text[m.end(1):],
+                       encoding="utf-8")
+        # Stale cache would keep the old architecture list.
+        shutil.rmtree(cml.parent / "build", ignore_errors=True)
+        self.r.log(f"  CMake CUDA architectures '{m.group(1)}' -> '{arch}' "
+                   f"(matches the installed GPU).", "ok")
+        return True
+
     def apply_patches(self):
-        return self.patch_gsplat() and self.patch_view_graph()
+        return (self.patch_gsplat() and self.patch_view_graph()
+                and self.patch_hierarchy_cmake())
 
     def warm_gsplat(self):
         """
