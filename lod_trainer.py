@@ -472,32 +472,72 @@ def to_pinhole(cam):
     return out, None
 
 
+def resolve_model_file(directory, stem, fmt):
+    """Find e.g. points3D.txt regardless of how it was capitalised."""
+    target = f"{stem}.{fmt}".lower()
+    try:
+        for p in directory.iterdir():
+            if p.is_file() and p.name.lower() == target:
+                return p
+    except OSError:
+        pass
+    return None
+
+
+def _model_format_in(directory):
+    """Return 'bin'/'txt' if a directory holds a complete model, else None."""
+    for fmt in ("bin", "txt"):
+        if all(resolve_model_file(directory, s, fmt) for s in MODEL_STEMS):
+            return fmt
+    return None
+
+
 def find_model_dir(root):
     """
     Locate the COLMAP model. Returns (dir, is_correct_location, fmt) where fmt
-    is 'bin', 'txt' or None.
+    is 'bin', 'txt' or None. Exports commonly drop the model straight into the
+    project root, or into sparse/ without the '0' subfolder.
     """
     root = Path(root)
     for candidate, correct in ((root / "sparse" / "0", True),
-                               (root / "sparse", False)):
+                               (root / "sparse", False),
+                               (root, False)):
         if not candidate.is_dir():
             continue
-        has_bin = all((candidate / f"{s}.bin").exists() for s in MODEL_STEMS)
-        has_txt = all((candidate / f"{s}.txt").exists() for s in MODEL_STEMS)
-        if has_bin:
-            return candidate, correct, "bin"
-        if has_txt:
-            return candidate, correct, "txt"
+        fmt = _model_format_in(candidate)
+        if fmt:
+            return candidate, correct, fmt
     return None, False, None
+
+
+def find_images_dir(root):
+    """
+    Locate the images. Returns (dir, is_correct_location, count). Captures often
+    keep the images loose in the project root alongside the model files.
+    """
+    root = Path(root)
+    sub = root / "images"
+    if sub.is_dir():
+        n = count_images(sub)
+        if n:
+            return sub, True, n
+    loose = sum(1 for p in root.iterdir()
+                if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+    if loose:
+        return root, False, loose
+    if sub.is_dir():
+        return sub, True, 0
+    return None, False, 0
 
 
 def analyse_cameras(model_dir, fmt):
     """Returns (models_summary, needs_conversion, blocking_reason)."""
+    src = resolve_model_file(Path(model_dir), "cameras", fmt)
+    if src is None:
+        return {}, False, "cameras file not found"
     try:
-        if fmt == "bin":
-            cams = _parse_cameras_binary(Path(model_dir) / "cameras.bin")
-        else:
-            cams = _parse_cameras_text(Path(model_dir) / "cameras.txt")
+        cams = (_parse_cameras_binary(src) if fmt == "bin"
+                else _parse_cameras_text(src))
     except Exception as exc:  # noqa: BLE001
         return {}, False, f"could not read cameras: {exc}"
     if not cams:
@@ -522,31 +562,54 @@ def analyse_cameras(model_dir, fmt):
 
 def prepare_dataset(root, log):
     """
-    Fix the two things that stop real COLMAP exports from loading: a model that
-    sits in sparse/ instead of sparse/0/, and undistorted-but-not-PINHOLE
-    cameras. Originals are kept alongside as .original.
+    Reshape a real-world COLMAP export into the layout the trainer expects:
+    images under images/, the model under sparse/0/, and PINHOLE cameras.
+    Originals are kept alongside as .original.
     """
     root = Path(root)
-    model_dir, correct, fmt = find_model_dir(root)
+    model_dir, model_ok, fmt = find_model_dir(root)
     if model_dir is None:
-        return False, "No COLMAP model found under sparse/."
+        return False, ("No COLMAP model found. Expected cameras, images and "
+                       "points3D (.bin or .txt) in the project root, sparse/, "
+                       "or sparse/0/.")
 
-    if not correct:
+    did = []
+
+    # 1. Images loose in the project root -> images/
+    img_dir, img_ok, n_images = find_images_dir(root)
+    if img_dir is not None and not img_ok and n_images:
+        target = root / "images"
+        target.mkdir(parents=True, exist_ok=True)
+        log(f"Moving {n_images} images into images/", "step")
+        moved = 0
+        for p in sorted(root.iterdir()):
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+                shutil.move(str(p), str(target / p.name))
+                moved += 1
+        log(f"  moved {moved} images", "ok")
+        did.append(f"moved {moved} images into images/")
+
+    # 2. Model files -> sparse/0/, normalising capitalisation
+    if not model_ok:
         target = root / "sparse" / "0"
         target.mkdir(parents=True, exist_ok=True)
-        log(f"Moving model files into {target}", "step")
-        for item in list(model_dir.iterdir()):
-            if item.is_dir():
+        from_root = model_dir.resolve() == root.resolve()
+        log("Moving COLMAP model into sparse/0/", "step")
+        for stem in MODEL_STEMS:
+            src = resolve_model_file(model_dir, stem, fmt)
+            if src is None:
                 continue
-            stem = item.stem.lower()
-            suffix = item.suffix.lower()
-            # Normalise Cameras.txt -> cameras.txt while we are here.
-            name = (f"points3D{suffix}" if stem == "points3d"
-                    else f"{stem}{suffix}" if stem in ("cameras", "images")
-                    else item.name)
-            shutil.move(str(item), str(target / name))
-            log(f"  {item.name} -> sparse/0/{name}", "out")
+            dst = target / f"{stem}.{fmt}"
+            shutil.move(str(src), str(dst))
+            log(f"  {src.name} -> sparse/0/{dst.name}", "out")
+        if not from_root:
+            # A dedicated sparse/ folder: bring any stragglers along too.
+            for p in list(model_dir.iterdir()):
+                if p.is_file():
+                    shutil.move(str(p), str(target / p.name))
+                    log(f"  {p.name} -> sparse/0/{p.name}", "out")
         model_dir = target
+        did.append("moved the model into sparse/0/")
 
     summary, needs_conv, blocker = analyse_cameras(model_dir, fmt)
     log(f"Camera models: {summary}", "info")
@@ -559,30 +622,31 @@ def prepare_dataset(root, log):
             "--input_path sparse/0 --output_path undistorted")
     if not needs_conv:
         log("Cameras are already PINHOLE.", "ok")
-        return True, "Dataset ready."
-
-    ext = "bin" if fmt == "bin" else "txt"
-    src = model_dir / f"cameras.{ext}"
-    backup = model_dir / f"cameras.{ext}.original"
-    cams = (_parse_cameras_binary(src) if fmt == "bin"
-            else _parse_cameras_text(src))
-    converted = []
-    for c in cams:
-        new, reason = to_pinhole(c)
-        if reason:
-            return False, reason
-        converted.append(new)
-
-    if not backup.exists():
-        shutil.copy2(src, backup)
-        log(f"Backed up original -> {backup.name}", "ok")
-    if fmt == "bin":
-        _write_cameras_binary(src, converted)
     else:
-        _write_cameras_text(src, converted)
-    log(f"Converted {len(converted)} cameras to PINHOLE (distortion was zero, "
-        f"so this is lossless).", "ok")
-    return True, f"Converted {len(converted)} cameras to PINHOLE."
+        src = resolve_model_file(model_dir, "cameras", fmt)
+        backup = src.with_name(src.name + ".original")
+        cams = (_parse_cameras_binary(src) if fmt == "bin"
+                else _parse_cameras_text(src))
+        converted = []
+        for c in cams:
+            new, reason = to_pinhole(c)
+            if reason:
+                return False, reason
+            converted.append(new)
+        if not backup.exists():
+            shutil.copy2(src, backup)
+            log(f"Backed up original -> {backup.name}", "ok")
+        if fmt == "bin":
+            _write_cameras_binary(src, converted)
+        else:
+            _write_cameras_text(src, converted)
+        log(f"Converted {len(converted)} cameras to PINHOLE (distortion was "
+            f"zero, so this is lossless).", "ok")
+        did.append(f"converted {len(converted)} cameras to PINHOLE")
+
+    if not did:
+        return True, "Dataset was already in the expected layout."
+    return True, "Prepared: " + ", ".join(did) + "."
 
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -623,14 +687,17 @@ def inspect_dataset(root):
     model_dir, correct_place, fmt = find_model_dir(root)
     if model_dir is None:
         msgs.append(("error",
-                     "No complete COLMAP model found. Expected cameras/images/"
-                     "points3D (.bin or .txt) under sparse/0/."))
+                     "No complete COLMAP model found. Expected cameras, images "
+                     "and points3D (.bin or .txt) in the project root, sparse/, "
+                     "or sparse/0/."))
         return False, 0, msgs, False
 
     if not correct_place:
+        where = ("the project root" if model_dir.resolve() == root.resolve()
+                 else "sparse/")
         msgs.append(("warn",
-                     "Model is in sparse/ but the trainer reads sparse/0/ - "
-                     "'Prepare dataset' will move it."))
+                     f"Model is in {where} but the trainer reads sparse/0/ - "
+                     f"'Prep' will move it."))
         ok = False
         fixable = True
     else:
@@ -647,22 +714,23 @@ def inspect_dataset(root):
     elif needs_conv:
         msgs.append(("warn",
                      "Cameras are not PINHOLE, but carry no distortion - "
-                     "'Prepare dataset' will convert them losslessly."))
+                     "'Prep' will convert them losslessly."))
         ok = False
         fixable = True
 
-    images_dir = root / "images"
-    count = 0
-    if not images_dir.is_dir():
-        msgs.append(("error", "Missing images/ folder."))
+    img_dir, images_placed, count = find_images_dir(root)
+    if img_dir is None or count == 0:
+        msgs.append(("error", "No images found. Expected an images/ folder, or "
+                              "image files in the project root."))
         ok = False
+    elif not images_placed:
+        msgs.append(("warn",
+                     f"{count} images are loose in the project root - 'Prep' "
+                     f"will move them into images/."))
+        ok = False
+        fixable = True
     else:
-        count = count_images(images_dir)
-        if count == 0:
-            msgs.append(("error", "images/ contains no image files."))
-            ok = False
-        else:
-            msgs.append(("ok", f"{count} images found."))
+        msgs.append(("ok", f"{count} images found."))
 
     if (root / "depths").is_dir():
         msgs.append(("ok", "Optional depths/ folder detected - depth loss enabled."))
@@ -1110,6 +1178,7 @@ class App(tk.Tk):
         self.vars = {}
         self.dataset_ok = False
         self.image_count = 0
+        self.graph_too_small = 0
         self._validate_job = None
 
         self._build_style()
@@ -1257,9 +1326,9 @@ class App(tk.Tk):
             side="left", fill="x", expand=True)
         ttk.Button(row, text="Browse...", command=self._pick_dataset).pack(
             side="left", padx=(8, 0))
-        self.prepare_btn = ttk.Button(row, text="Prepare dataset",
+        self.prepare_btn = ttk.Button(row, text="Prep",
                                       command=self._prepare_dataset,
-                                      state="disabled")
+                                      state="disabled", width=8)
         self.prepare_btn.pack(side="left", padx=(6, 0))
 
         self.ds_status = tk.Text(ds, height=7, wrap="word", relief="flat",
@@ -1603,21 +1672,52 @@ class App(tk.Tk):
                 self.ds_status.insert(
                     "end",
                     f"  - Only {usable} usable images, but graph view selection "
-                    f"needs more than {k}. Turn off 'Graph view selection' on the "
-                    f"Parameters tab, or use a larger capture.\n", "error")
-                self.dataset_ok = False
+                    f"needs more than {k}. Starting training will offer to turn "
+                    f"it off.\n", "warn")
+                self.graph_too_small = usable
+            else:
+                self.graph_too_small = 0
+        else:
+            self.graph_too_small = 0
         self.ds_status.configure(state="disabled")
+
+    @staticmethod
+    def _prep_plan(path):
+        """Human-readable list of what Prep would change, for confirmation."""
+        root = Path(path)
+        plan = []
+        img_dir, images_placed, count = find_images_dir(root)
+        if img_dir is not None and count and not images_placed:
+            plan.append(f"move {count} images into images/")
+        model_dir, model_ok, fmt = find_model_dir(root)
+        if model_dir is not None and not model_ok:
+            where = ("the project root" if model_dir.resolve() == root.resolve()
+                     else "sparse/")
+            plan.append(f"move the COLMAP model from {where} into sparse/0/")
+        if model_dir is not None:
+            summary, needs_conv, blocker = analyse_cameras(model_dir, fmt)
+            if needs_conv and not blocker:
+                n = sum(summary.values())
+                models = "/".join(sorted(summary))
+                plan.append(f"rewrite {n} {models} cameras as PINHOLE "
+                            f"(lossless - they carry no distortion)")
+        return plan
 
     def _prepare_dataset(self):
         path = self.dataset_var.get().strip()
         if not path:
             return
+        plan = self._prep_plan(path)
+        if not plan:
+            messagebox.showinfo(APP_NAME, "Nothing to fix - this dataset is "
+                                          "already in the expected layout.")
+            return
         if not messagebox.askyesno(
                 APP_NAME,
-                "Prepare this dataset for training?\n\n"
-                "This may move the COLMAP model from sparse/ into sparse/0/ and "
-                "rewrite cameras as PINHOLE. The original camera file is kept "
-                "alongside as '.original'.\n\nProceed?"):
+                "Prep will make these changes inside the dataset folder:\n\n"
+                + "\n".join(f"  • {p}" for p in plan)
+                + "\n\nFiles are moved, not copied, and the original camera "
+                  "file is kept alongside as '.original'.\n\nProceed?"):
             return
         ok, message = prepare_dataset(path, lambda m, t="info": self._log_line((t, m)))
         self._log_line(("ok" if ok else "error", message))
@@ -1742,6 +1842,25 @@ class App(tk.Tk):
         except ValueError as exc:
             messagebox.showerror(APP_NAME, str(exc))
             return
+
+        # The view graph fits a 100-nearest-neighbour graph over the cameras,
+        # so a small capture cannot supply enough points and training would die
+        # partway through building it.
+        if self.graph_too_small and cfg.get("graph_view_select"):
+            choice = messagebox.askyesnocancel(
+                APP_NAME,
+                f"Graph view selection needs more than 100 usable images, but "
+                f"this capture has {self.graph_too_small}.\n\n"
+                f"Yes  - turn it off and train normally\n"
+                f"No   - leave it on (training will fail while building the graph)\n"
+                f"Cancel - go back")
+            if choice is None:
+                return
+            if choice:
+                cfg["graph_view_select"] = False
+                self.vars["graph_view_select"][0].set(False)
+                self._log_line(("warn", "Graph view selection turned off - "
+                                        "too few images for a k=100 graph."))
 
         if cfg["densify_until_iter"] > cfg["iterations"]:
             messagebox.showwarning(

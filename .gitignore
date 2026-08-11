@@ -9,9 +9,15 @@
 
 # Local datasets and training output (very large)
 /test/
+/tests/
+/datasets/
+/data/
 *.dhier
 *.gdf
 *.ply
+
+# Git history backups
+*.bundle
 
 # Saved UI state, specific to one machine
 settings.json

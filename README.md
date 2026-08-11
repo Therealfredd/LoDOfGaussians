@@ -31,20 +31,35 @@ touched.
 the layout and tells you what is wrong before you waste hours on a failed run.
 Choose a preset, then Start.
 
-If the dataset needs fixing, **Prepare dataset** lights up. It handles the two
-things that stop real-world COLMAP exports from loading:
+If the layout isn't what the trainer expects, **Prep** lights up. It handles the
+three things that stop real-world COLMAP exports from loading:
 
-- a model sitting in `sparse/` instead of `sparse/0/` (files are moved and
-  their names normalised)
-- cameras that are not `PINHOLE`. The loader asserts `PINHOLE` exactly, but
+- **images loose in the project root** rather than in `images/` — a common
+  export shape where the photos and the model files all sit in one folder
+- **the model in the wrong place** — in the project root, or in `sparse/`
+  without the `0` subfolder. Files are moved into `sparse/0/` and their names
+  normalised (`Cameras.txt` → `cameras.txt`), matched case-insensitively
+- **cameras that are not `PINHOLE`.** The loader asserts `PINHOLE` exactly, but
   exports are frequently `FULL_OPENCV`, `OPENCV` or `SIMPLE_RADIAL` with all
   distortion coefficients set to zero — already undistorted, just labelled
   differently. Those are rewritten to `PINHOLE`, which is lossless; focal
-  length and principal point carry over untouched.
+  length, principal point and image size carry over untouched.
 
-The original camera file is kept beside the new one as `.original`. If the
-cameras carry *real* distortion, the app refuses and tells you to run
-`colmap image_undistorter` — converting would silently corrupt the result.
+So a folder like this works straight away:
+
+```
+my-capture/
+├─ 00001.png … 00036.png
+├─ Cameras.txt
+├─ Images.txt
+└─ Points3D.txt
+```
+
+Prep lists exactly what it will change and asks first. Files are moved, not
+copied, and the original camera file is kept beside the new one as
+`.original`. Running it twice is a no-op. If the cameras carry *real*
+distortion, it refuses and tells you to run `colmap image_undistorter` —
+converting would silently corrupt the result.
 
 **3. Parameters** — every knob that matters, grouped and explained. Values are
 merged over the paper defaults and written to `repo/configs/lod_trainer.json`.
@@ -64,7 +79,8 @@ Settings persist in `settings.json` between sessions.
 └─ masks/              (optional)
 ```
 
-Binary and text COLMAP models both work. Results are written to
+Binary and text COLMAP models both work, and **Prep** will reshape an export
+into this layout for you. Results are written to
 `<your folder>/output/` unless you override the output folder, with the final
 hierarchy saved as the `.dhier` file named in the parameters.
 
@@ -160,8 +176,9 @@ of headroom on a 24 GB card for the full-length schedule.
   for the hierarchy step, so a space anywhere in the dataset or install path
   breaks it. The app flags this before you start.
 - **Graph view selection needs >100 images.** It fits a k-nearest-neighbour
-  graph over cameras with k hardcoded to 100 upstream, so smaller captures fail.
-  The app checks your image count and tells you to turn it off.
+  graph over cameras with k hardcoded to 100 upstream, so smaller captures
+  cannot supply enough points. The app counts your images (allowing for the
+  holdout stride) and offers to switch it off when you press Start.
 - **`cache_size` is the VRAM dial.** If you hit out-of-memory, lower it first.
 - **Resume works, but watch the scaffold length.** Leave *skip the coarse pass
   if a scaffold already exists* ticked and an interrupted run picks up from the
