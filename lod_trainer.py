@@ -373,25 +373,43 @@ def needs_unsupported_compiler_flag(cuda_version, toolset):
     return (cmaj, cmin) < (12, 6)
 
 
-# nvcc and MSVC guard each other's versions independently:
-#   nvcc's crt/host_config.h rejects an unknown MSVC ("unsupported Microsoft
-#     Visual Studio version") - cured by -allow-unsupported-compiler
-#   MSVC's yvals_core.h rejects an unknown nvcc ("STL1002: Unexpected compiler
-#     version") - cured by _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
-# Either can fire depending on which side is newer, so try them in turn.
-NVCC_FLAG_LADDER = [
-    [],
-    ["-allow-unsupported-compiler"],
-    ["-allow-unsupported-compiler", "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"],
-    ["-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"],
+# nvcc, MSVC and CUDA's bundled CCCL each police the toolchain separately, and
+# which one complains depends on the version mix. Each names its own cure, so
+# rather than enumerate combinations, read the error and apply the remedy it
+# asks for. (markers, flags) - each entry is applied at most once.
+NVCC_REMEDIES = [
+    # nvcc's crt/host_config.h does not recognise this MSVC
+    (("unsupported Microsoft Visual Studio version",),
+     ["-allow-unsupported-compiler"]),
+    # MSVC's yvals_core.h does not recognise this nvcc
+    (("STL1002", "_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"),
+     ["-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"]),
+    # CUDA 13's CCCL requires MSVC's conforming preprocessor
+    (("Zc:preprocessor", "traditional preprocessor"),
+     ["-Xcompiler", "/Zc:preprocessor"]),
+    # ...and if that is not enough, silence the check outright
+    (("Zc:preprocessor", "traditional preprocessor"),
+     ["-DCCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING"]),
 ]
+
+
+def _probe_source(cuda_root):
+    """
+    Mirror what a torch extension actually includes. A bare kernel compiles
+    happily and misses the CCCL preprocessor check that real builds hit.
+    """
+    lines = ["#include <cuda_runtime.h>"]
+    if (Path(cuda_root) / "include" / "cccl").is_dir():
+        lines.append("#include <cuda/std/type_traits>")
+    lines.append("__global__ void k() {}")
+    return "\n".join(lines) + "\n"
 
 
 def probe_nvcc_host_compiler(cuda_root, env):
     """
-    Compile a trivial .cu to find the flags nvcc needs to accept the installed
-    MSVC. Version tables cannot keep up with new CUDA/MSVC releases, so ask the
-    compilers themselves.
+    Compile a representative .cu, and when it fails, apply the remedy the error
+    message names and try again. Version tables cannot keep up with new
+    CUDA/MSVC releases, so ask the compilers themselves.
 
     Returns (works, flags, detail); detail is the output of the last failure.
     Advisory only - a probe that fails for an unrelated reason must never block
@@ -404,18 +422,25 @@ def probe_nvcc_host_compiler(cuda_root, env):
         return True, [], f"nvcc not found at {nvcc}"
     tmp = Path(tempfile.mkdtemp(prefix="lodtrainer_nvcc_"))
     src = tmp / "probe.cu"
-    src.write_text("#include <cuda_runtime.h>\n__global__ void k() {}\n",
-                   encoding="utf-8")
-    detail = ""
+    src.write_text(_probe_source(cuda_root), encoding="utf-8")
+    flags, applied, detail = [], set(), ""
     try:
-        for flags in NVCC_FLAG_LADDER:
+        for _ in range(len(NVCC_REMEDIES) + 1):
             rc, out = _run_capture(
                 [str(nvcc), *flags, "-c", str(src), "-o", str(tmp / "probe.obj")],
                 cwd=str(tmp), env=env, timeout=300)
             if rc == 0:
                 return True, list(flags), ""
             detail = out
-        return False, [], detail
+            for i, (markers, remedy) in enumerate(NVCC_REMEDIES):
+                if i in applied or not any(m in out for m in markers):
+                    continue
+                applied.add(i)
+                flags.extend(remedy)
+                break
+            else:
+                break   # nothing left to try for this error
+        return False, list(flags), detail
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -984,10 +1009,15 @@ class Installer:
                            "check is advisory. The compiler said:", "warn")
                 for line in [l for l in detail.splitlines() if l.strip()][:8]:
                     self.r.log(f"    {line[:200]}", "dim")
-                # Best effort: these flags are harmless when unnecessary and
-                # are the usual cure when either side rejects the other.
-                self.opts["nvcc_flags"] = NVCC_FLAG_LADDER[-2]
-                self.r.log(f"    applying {' '.join(NVCC_FLAG_LADDER[-2])} "
+                # Keep whatever remedies the probe did manage to identify, plus
+                # the usual suspects - they are harmless when unnecessary.
+                precaution = list(flags)
+                for _markers, remedy in NVCC_REMEDIES[:3]:
+                    for f in remedy:
+                        if f not in precaution:
+                            precaution.append(f)
+                self.opts["nvcc_flags"] = precaution
+                self.r.log(f"    applying {' '.join(precaution)} "
                            f"as a precaution.", "warn")
                 others = [v for v, _ in (self.opts.get("all_cuda") or [])
                           if v != self.opts.get("cuda_version")
@@ -1114,10 +1144,16 @@ class Installer:
                 return False
             self.r.log(f"Building CUDA extension: {name} (this takes a while)...", "step")
             if self.r.run(cmd, env=self.build_env) != 0:
-                extra = ("" if self.opts.get("allow_unsupported") else
-                         "\n    If the log mentions an unsupported Microsoft "
-                         "Visual Studio version, tick 'Allow unsupported host "
-                         "compiler' on the Setup tab and retry.")
+                used = self.build_env.get("NVCC_PREPEND_FLAGS", "") or "(none)"
+                others = [v for v, _ in (self.opts.get("all_cuda") or [])
+                          if v != self.opts.get("cuda_version")
+                          and torch_index_for_cuda(v)]
+                extra = (f"\n    Compiler flags used: {used}"
+                         f"\n    Look for the first 'fatal error' line above - "
+                         f"it usually names the flag it wants.")
+                if others:
+                    extra += (f"\n    You could also try CUDA "
+                              f"{', '.join(others)} on the Setup tab.")
                 return self._fail(f"Failed to build {name}.{extra}")
         return True
 

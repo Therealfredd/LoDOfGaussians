@@ -120,20 +120,25 @@ Two things this launcher handles automatically that trip up a manual install:
   gets `cu132` against 13.2 rather than pairing 13.2 with a CUDA 12 wheel. The
   dropdown shows the wheel each toolkit maps to, and setup refuses early with a
   clear message rather than failing deep inside a pip build.
-- **nvcc and MSVC each reject the other's version, independently.** nvcc's
-  `crt/host_config.h` refuses an MSVC it doesn't recognise; MSVC's
-  `yvals_core.h` refuses an nvcc it doesn't recognise (*"STL1002: Unexpected
-  compiler version"*). They have different cures —
-  `-allow-unsupported-compiler` and `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`
-  — and which one fires depends on which side is newer. Version tables go stale
-  every release, so setup compiles a throwaway kernel and works up a ladder of
-  flag combinations until one succeeds, then uses exactly that set for the real
-  builds. On this machine that takes CUDA 11.8 from "will not compile at all"
-  to compiling cleanly against MSVC 14.41.
+- **Three separate parts of the toolchain police each other's versions**, and
+  which one complains depends entirely on the version mix:
 
-  This check is **advisory**: if the probe fails for some unrelated reason it
-  prints what the compiler actually said, applies the flags as a precaution and
-  carries on, rather than blocking a build that might have worked.
+  | Guard | Complains when | Cure |
+  | --- | --- | --- |
+  | nvcc `crt/host_config.h` | MSVC is newer than CUDA knows | `-allow-unsupported-compiler` |
+  | MSVC `yvals_core.h` | nvcc is not what the STL expects (*STL1002*) | `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` |
+  | CUDA 13's bundled CCCL | MSVC uses its traditional preprocessor | `/Zc:preprocessor` |
+
+  Version tables go stale every release, so setup compiles a representative
+  kernel instead, reads the error, applies the remedy that error names, and
+  retries — then uses exactly that flag set for the real builds. Locally this
+  takes CUDA 11.8 from "will not compile at all" to compiling cleanly against
+  MSVC 14.41.
+
+  This check is **advisory**: if it fails for some unrelated reason it prints
+  what the compiler actually said, applies the known remedies as a precaution
+  and carries on, rather than blocking a build that might have worked. When an
+  extension build does fail, the error names the flags that were in effect.
 - **The compiler environment is needed at training time, not just at install
   time.** `gsplat` compiles its kernels on first use, so the app runs training
   with the MSVC environment loaded — otherwise the first iteration dies looking
