@@ -21,7 +21,7 @@ import time
 import tkinter as tk
 import urllib.request
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 APP_NAME = "LoD Trainer"
 APP_DIR = Path(__file__).resolve().parent
@@ -32,6 +32,8 @@ VENV_DIR = APP_DIR / "venv"
 TORCH_EXT_DIR = APP_DIR / "torch_extensions"
 GSPLAT_PATCH_MARKER = "# lod_trainer: MSVC-safe flags"
 VIEWGRAPH_PATCH_MARKER = "# lod_trainer: accept standard COLMAP pose lines"
+SNAPSHOT_PATCH_MARKER = "# lod_trainer: on-demand .ply snapshot"
+SNAPSHOT_FLAG = "save_now.flag"
 SETTINGS_FILE = APP_DIR / "settings.json"
 REPO_URL = "https://github.com/FelixWindisch/LoDOfGaussians.git"
 FUSED_SSIM_URL = "git+https://github.com/rahul-goel/fused-ssim/"
@@ -111,6 +113,51 @@ DEFAULT_CONFIG = {
     "output_file_name": "result.dhier",
 }
 
+# Spherical-harmonic "rest" coefficients per degree, from the repo's globals.py
+# (number_SH_properties). A Gaussian is stored as 14 floats - xyz(3), scale(3),
+# rotation(4), colour DC(3), opacity(1) - plus 3 channels x these coefficients,
+# all float32. This is what the GPU cache actually holds.
+SH_REST_COEFFS = [0, 3, 8, 15]
+BYTES_PER_FLOAT = 4
+GB = 1024 ** 3
+
+
+def floats_per_gaussian(sh_degree):
+    try:
+        degree = max(0, min(3, int(sh_degree)))
+    except (TypeError, ValueError):
+        degree = 1
+    return 14 + 3 * SH_REST_COEFFS[degree]
+
+
+def bytes_per_gaussian(sh_degree):
+    return floats_per_gaussian(sh_degree) * BYTES_PER_FLOAT
+
+
+def gaussians_to_gb(count, sh_degree):
+    try:
+        return float(count) * bytes_per_gaussian(sh_degree) / GB
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def gb_to_gaussians(gigabytes, sh_degree):
+    try:
+        return int(round(float(gigabytes) * GB / bytes_per_gaussian(sh_degree)))
+    except (TypeError, ValueError):
+        return 0
+
+
+# Passed to train.py on the command line rather than through the config file:
+# these live on ModelParams, which the config JSON does not feed.
+# (arg name, label, kind, default, help)
+MODEL_PARAM_SPEC = [
+    ("resolution", "Max image width (px)", "int", -1,
+     "Training resolution. -1 downscales anything wider than 1600px to 1600. "
+     "Any value above 8 is taken as the width in pixels. Beware: 1, 2, 4 and 8 "
+     "mean 'divide the original width by this' instead - an upstream quirk."),
+]
+
 # (config key, label, widget kind, help text)
 PARAM_SPEC = [
     ("Quality / length", [
@@ -137,9 +184,10 @@ PARAM_SPEC = [
         ("percent_dense", "Percent dense", "float", ""),
     ]),
     ("Level of detail / streaming", [
-        ("cache_size", "GPU cache size", "int",
-         "Gaussians held on the GPU. The main VRAM dial - lower this first if you hit OOM."),
-        ("cache_size_after_reduction", "Cache size after reduction", "int",
+        ("cache_size", "GPU cache size (GB)", "gb",
+         "Gaussians held on the GPU. The main VRAM dial - lower this first if "
+         "you hit OOM."),
+        ("cache_size_after_reduction", "Cache size after reduction (GB)", "gb",
          "Target after a cache flush. Keep below the cache size."),
         ("use_GPU_caching", "Use GPU caching", "bool", ""),
         ("clear_cache_interval", "Clear cache every N iters", "int", ""),
@@ -1275,9 +1323,58 @@ class Installer:
                    f"(matches the installed GPU).", "ok")
         return True
 
+    def patch_snapshot_hook(self):
+        """
+        Let the GUI ask a running trainer for a .ply of the current iteration.
+        Upstream only saves at fixed iterations, so add a once-per-iteration
+        check for a flag file the GUI drops in the output folder.
+        """
+        target_file = REPO_DIR / "train_hierarchy.py"
+        if not target_file.exists():
+            self.r.log("  train_hierarchy.py not found; skipping.", "warn")
+            return True
+        text = target_file.read_text(encoding="utf-8")
+        if SNAPSHOT_PATCH_MARKER in text:
+            self.r.log("  snapshot hook already installed.", "ok")
+            return True
+        anchor = "                    if iteration == opt.iterations:"
+        if anchor not in text:
+            self.r.log("  Could not find the save block in train_hierarchy.py; "
+                       "'Save .ply now' will not work.", "warn")
+            return True
+        # save_ply hardcodes a 3x3 SH reshape, so it only succeeds at SH
+        # degree 1. Never let a failed snapshot take the training run with it.
+        hook = (
+            f"                    {SNAPSHOT_PATCH_MARKER}\n"
+            f"                    __snap = os.path.join(dataset.output_path,"
+            f" \"{SNAPSHOT_FLAG}\")\n"
+            "                    if os.path.exists(__snap):\n"
+            "                        try:\n"
+            "                            os.remove(__snap)\n"
+            "                        except OSError:\n"
+            "                            pass\n"
+            "                        try:\n"
+            "                            __p = os.path.join(dataset.output_path,\n"
+            "                                f\"snapshot_iteration_{iteration}.ply\")\n"
+            "                            gaussians.save_ply(__p)\n"
+            "                            print(f\"\\n[ITER {iteration}] Saved snapshot"
+            " to {__p}\")\n"
+            "                        except Exception as __e:\n"
+            "                            print(f\"\\n[ITER {iteration}] Snapshot failed:"
+            " {__e}\")\n"
+            "\n"
+        )
+        backup = target_file.with_suffix(".py.original")
+        if not backup.exists():
+            shutil.copy2(target_file, backup)
+        target_file.write_text(text.replace(anchor, hook + anchor, 1),
+                               encoding="utf-8")
+        self.r.log("  Installed the on-demand snapshot hook.", "ok")
+        return True
+
     def apply_patches(self):
         return (self.patch_gsplat() and self.patch_view_graph()
-                and self.patch_hierarchy_cmake())
+                and self.patch_hierarchy_cmake() and self.patch_snapshot_hook())
 
     def warm_gsplat(self):
         """
@@ -1421,6 +1518,10 @@ class App(tk.Tk):
 
         self.env_info = {}
         self.vars = {}
+        self.model_vars = {}
+        self.gb_hints = {}
+        self.user_presets = {}
+        self.current_output_dir = None
         self.dataset_ok = False
         self.image_count = 0
         self.graph_too_small = 0
@@ -1432,7 +1533,7 @@ class App(tk.Tk):
         self._load_settings()
         self._refresh_status()
         self.dataset_var.trace_add("write", lambda *_: self._schedule_validate())
-        self.after(60, self._drain_log)
+        self._drain_job = self.after(60, self._drain_log)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # -- layout ------------------------------------------------------------
@@ -1617,19 +1718,32 @@ class App(tk.Tk):
         self.preset_var = tk.StringVar(value="Default (paper settings)")
         row = ttk.Frame(pre)
         row.pack(fill="x")
-        combo = ttk.Combobox(row, textvariable=self.preset_var, state="readonly",
-                             values=list(PRESETS), width=30)
-        combo.pack(side="left")
-        combo.bind("<<ComboboxSelected>>", lambda e: self._apply_preset())
-        ttk.Label(row, style="Sub.TLabel",
-                  text="   Applies a set of parameters; fine-tune them on the "
-                       "Parameters tab.").pack(side="left")
+        self.preset_combo = ttk.Combobox(row, textvariable=self.preset_var,
+                                         state="readonly", width=30)
+        self.preset_combo.pack(side="left")
+        self.preset_combo.bind("<<ComboboxSelected>>",
+                               lambda e: self._apply_preset())
+        ttk.Button(row, text="Save as...", command=self._save_preset).pack(
+            side="left", padx=(8, 0))
+        self.delete_preset_btn = ttk.Button(row, text="Delete",
+                                            command=self._delete_preset,
+                                            state="disabled")
+        self.delete_preset_btn.pack(side="left", padx=(4, 0))
+        ttk.Label(pre, style="Sub.TLabel", justify="left",
+                  text="Applies a set of parameters; fine-tune them on the "
+                       "Parameters tab. 'Save as...' stores everything currently "
+                       "set, including image width.").pack(anchor="w", pady=(6, 0))
+        self._refresh_preset_list()
 
         actions = ttk.Frame(tab)
         actions.pack(fill="x", pady=(16, 0))
         self.train_btn = ttk.Button(actions, text="Start training",
                                     command=self._start_training)
         self.train_btn.pack(side="left")
+        self.snapshot_btn = ttk.Button(actions, text="Save .ply now",
+                                       command=self._save_snapshot,
+                                       state="disabled")
+        self.snapshot_btn.pack(side="left", padx=8)
         ttk.Button(actions, text="Open output folder",
                    command=self._open_output).pack(side="left", padx=8)
         self.elapsed_label = ttk.Label(actions, text="", style="Sub.TLabel")
@@ -1671,6 +1785,16 @@ class App(tk.Tk):
                     ttk.Combobox(box, textvariable=var, state="readonly", width=16,
                                  values=kind.split(":", 1)[1].split(",")).grid(
                         row=r, column=1, sticky="w", pady=3)
+                elif kind == "gb":
+                    cell = ttk.Frame(box)
+                    cell.grid(row=r, column=1, sticky="w", pady=3)
+                    var = tk.StringVar(
+                        value=f"{gaussians_to_gb(default, DEFAULT_CONFIG['SH_degree']):.2f}")
+                    ttk.Entry(cell, textvariable=var, width=8).pack(side="left")
+                    hint = ttk.Label(cell, text="", style="Sub.TLabel")
+                    hint.pack(side="left", padx=(6, 0))
+                    self.gb_hints[key] = hint
+                    var.trace_add("write", lambda *_: self._refresh_gb_hints())
                 else:
                     var = tk.StringVar(value=self._fmt(default))
                     ttk.Entry(box, textvariable=var, width=18).grid(
@@ -1678,13 +1802,65 @@ class App(tk.Tk):
                 self.vars[key] = (var, kind)
                 if helptext:
                     ttk.Label(box, text=helptext, style="Sub.TLabel",
-                              wraplength=560, justify="left").grid(
+                              wraplength=540, justify="left").grid(
                         row=r, column=2, sticky="w", padx=(12, 0))
+
+        # Passed on the command line rather than through the config file.
+        box = ttk.LabelFrame(inner, text="Input images", padding=10,
+                             style="Section.TLabelframe")
+        box.pack(fill="x", pady=(0, 12))
+        box.columnconfigure(2, weight=1)
+        for r, (key, label, kind, default, helptext) in enumerate(MODEL_PARAM_SPEC):
+            ttk.Label(box, text=label).grid(row=r, column=0, sticky="w",
+                                            padx=(0, 10), pady=3)
+            var = tk.StringVar(value=self._fmt(default))
+            ttk.Entry(box, textvariable=var, width=18).grid(
+                row=r, column=1, sticky="w", pady=3)
+            self.model_vars[key] = (var, kind, default)
+            ttk.Label(box, text=helptext, style="Sub.TLabel",
+                      wraplength=540, justify="left").grid(
+                row=r, column=2, sticky="w", padx=(12, 0))
 
         btns = ttk.Frame(inner)
         btns.pack(fill="x")
         ttk.Button(btns, text="Reset to defaults",
-                   command=lambda: self._apply_config(DEFAULT_CONFIG)).pack(side="left")
+                   command=self._reset_defaults).pack(side="left")
+        # SH degree changes bytes per Gaussian, so the GB fields must re-read.
+        self.vars["SH_degree"][0].trace_add(
+            "write", lambda *_: self._refresh_gb_hints())
+
+    def _reset_defaults(self):
+        self._apply_config(DEFAULT_CONFIG)
+        for key, (var, _kind, default) in self.model_vars.items():
+            var.set(self._fmt(default))
+
+    def _refresh_gb_hints(self):
+        """Show the Gaussian count each GB figure works out to."""
+        sh_degree = self._sh_degree()
+        per = bytes_per_gaussian(sh_degree)
+        for key, hint in self.gb_hints.items():
+            var = self.vars.get(key)
+            if not var:
+                continue
+            try:
+                count = gb_to_gaussians(float(var[0].get()), sh_degree)
+                hint.configure(text=f"= {count:,} Gaussians @ {per} B")
+            except (ValueError, tk.TclError):
+                hint.configure(text="?")
+
+    def collect_model_params(self):
+        """Command-line ModelParams values; raises ValueError on bad input."""
+        out = {}
+        for key, (var, kind, default) in self.model_vars.items():
+            raw = str(var.get()).strip()
+            if not raw:
+                out[key] = default
+                continue
+            try:
+                out[key] = int(float(raw)) if kind == "int" else raw
+            except ValueError:
+                raise ValueError(f"'{key}' must be a whole number (got '{raw}').")
+        return out
 
     @staticmethod
     def _fmt(value):
@@ -1799,28 +1975,114 @@ class App(tk.Tk):
             self.train_btn.state(["disabled"])
 
     # -- settings ----------------------------------------------------------
+    def _sh_degree(self):
+        """SH degree currently set in the UI - decides bytes per Gaussian."""
+        var = self.vars.get("SH_degree")
+        if not var:
+            return DEFAULT_CONFIG["SH_degree"]
+        try:
+            return int(float(var[0].get()))
+        except (ValueError, tk.TclError):
+            return DEFAULT_CONFIG["SH_degree"]
+
     def _apply_config(self, cfg):
         for key, (var, kind) in self.vars.items():
             if key not in cfg:
                 continue
             if kind == "bool":
                 var.set(bool(cfg[key]))
+            elif kind == "gb":
+                # stored as a Gaussian count, shown in GB
+                var.set(f"{gaussians_to_gb(cfg[key], self._sh_degree()):.2f}")
             else:
                 var.set(self._fmt(cfg[key]))
+        self._refresh_gb_hints()
+
+    def _refresh_preset_list(self):
+        names = list(PRESETS) + sorted(self.user_presets)
+        self.preset_combo["values"] = names
+        if self.preset_var.get() not in names:
+            self.preset_var.set(names[0])
+        self.delete_preset_btn.state(
+            ["!disabled" if self.preset_var.get() in self.user_presets
+             else "disabled"])
 
     def _apply_preset(self):
-        cfg = dict(DEFAULT_CONFIG)
-        cfg.update(PRESETS.get(self.preset_var.get(), {}))
-        self._apply_config(cfg)
-        self._log_line(("info", f"Applied preset: {self.preset_var.get()}"))
+        name = self.preset_var.get()
+        if name in self.user_presets:
+            saved = self.user_presets[name]
+            cfg = dict(DEFAULT_CONFIG)
+            cfg.update(saved.get("config", {}))
+            self._apply_config(cfg)
+            for key, value in (saved.get("model") or {}).items():
+                if key in self.model_vars:
+                    self.model_vars[key][0].set(self._fmt(value))
+        else:
+            cfg = dict(DEFAULT_CONFIG)
+            cfg.update(PRESETS.get(name, {}))
+            self._apply_config(cfg)
+        self._refresh_preset_list()
+        self._log_line(("info", f"Applied preset: {name}"))
+
+    def _save_preset(self):
+        try:
+            cfg = self.collect_config()
+            model = self.collect_model_params()
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+        current = self.preset_var.get()
+        suggestion = current if current in self.user_presets else ""
+        name = simpledialog.askstring(
+            APP_NAME, "Save the current parameters as:", initialvalue=suggestion,
+            parent=self)
+        if name is None:
+            return
+        name = name.strip()
+        if not name:
+            messagebox.showerror(APP_NAME, "Please give the preset a name.")
+            return
+        if name in PRESETS:
+            messagebox.showerror(
+                APP_NAME, f"'{name}' is a built-in preset name. Pick another.")
+            return
+        if name in self.user_presets and not messagebox.askyesno(
+                APP_NAME, f"Overwrite the saved preset '{name}'?"):
+            return
+        self.user_presets[name] = {"config": cfg, "model": model}
+        self.preset_var.set(name)
+        self._refresh_preset_list()
+        self._save_settings()
+        self._log_line(("ok", f"Saved preset: {name}"))
+
+    def _delete_preset(self):
+        name = self.preset_var.get()
+        if name not in self.user_presets:
+            return
+        if not messagebox.askyesno(APP_NAME, f"Delete the preset '{name}'?"):
+            return
+        del self.user_presets[name]
+        self.preset_var.set(list(PRESETS)[0])
+        self._refresh_preset_list()
+        self._save_settings()
+        self._log_line(("warn", f"Deleted preset: {name}"))
 
     def collect_config(self):
         """Merge UI values over the defaults; raise ValueError on bad input."""
         cfg = dict(DEFAULT_CONFIG)
+        sh_degree = self._sh_degree()
         for key, (var, kind) in self.vars.items():
             raw = var.get()
             if kind == "bool":
                 cfg[key] = bool(raw)
+            elif kind == "gb":
+                try:
+                    gigabytes = float(str(raw).strip())
+                except ValueError:
+                    raise ValueError(f"'{key}' must be a size in GB (got '{raw}').")
+                if gigabytes <= 0:
+                    raise ValueError(f"'{key}' must be greater than 0 GB.")
+                cfg[key] = gb_to_gaussians(gigabytes, sh_degree)
             elif kind == "int":
                 try:
                     cfg[key] = int(float(str(raw).strip()))
@@ -1843,12 +2105,20 @@ class App(tk.Tk):
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except Exception:  # noqa: BLE001 - a corrupt settings file is not fatal
             return
+        self.user_presets = {k: v for k, v in
+                             (data.get("user_presets") or {}).items()
+                             if isinstance(v, dict) and k not in PRESETS}
+        self._refresh_preset_list()
         self.dataset_var.set(data.get("dataset", ""))
         self.output_var.set(data.get("output", ""))
         self.preset_var.set(data.get("preset", "Default (paper settings)"))
         self.skip_var.set(data.get("skip_if_exists", True))
         self.extras_var.set(data.get("extras", False))
         self._apply_config(data.get("config", {}))
+        for key, value in (data.get("model_params") or {}).items():
+            if key in self.model_vars:
+                self.model_vars[key][0].set(self._fmt(value))
+        self._refresh_preset_list()
         if self.dataset_var.get():
             self._validate_dataset()
 
@@ -1857,6 +2127,10 @@ class App(tk.Tk):
             cfg = self.collect_config()
         except ValueError:
             cfg = {}
+        try:
+            model = self.collect_model_params()
+        except ValueError:
+            model = {}
         data = {
             "dataset": self.dataset_var.get(),
             "output": self.output_var.get(),
@@ -1864,6 +2138,8 @@ class App(tk.Tk):
             "skip_if_exists": bool(self.skip_var.get()),
             "extras": bool(self.extras_var.get()),
             "config": cfg,
+            "model_params": model,
+            "user_presets": self.user_presets,
         }
         try:
             SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -1997,6 +2273,8 @@ class App(tk.Tk):
         else:
             self.progress.stop()
             self.progress.configure(mode="determinate")
+            self.current_output_dir = None
+            self.snapshot_btn.state(["disabled"])
             self._refresh_status()
 
     def _spawn(self, fn, progress_mode="determinate"):
@@ -2160,18 +2438,26 @@ class App(tk.Tk):
                     return
                 skip = choice
 
+        try:
+            model = self.collect_model_params()
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+
         self._save_settings()
         self.nb.select(1)
         opts = self._installer_opts()
         self.train_start = time.time()
+        self.current_output_dir = output or str(Path(dataset) / "output")
+        self.snapshot_btn.state(["!disabled"])
 
         def job():
-            self._run_training(cfg, dataset, output, skip, opts)
+            self._run_training(cfg, dataset, output, skip, opts, model)
 
         self._spawn(job, progress_mode="determinate")
         self._tick_elapsed()
 
-    def _run_training(self, cfg, dataset, output, skip, opts):
+    def _run_training(self, cfg, dataset, output, skip, opts, model=None):
         r = self.runner
         # train.py opens the config as configs/<name>, relative to its own cwd.
         cfg_name = "lod_trainer.json"
@@ -2190,10 +2476,19 @@ class App(tk.Tk):
         cmd = [str(venv_python()), "train.py",
                "--project_dir", dataset,
                "--config", cfg_name]
+        # ModelParams live on the command line, not in the config file.
+        for key, value in (model or {}).items():
+            cmd += [f"--{key}", str(value)]
         if output:
             cmd += ["--output_dir", output]
         if skip:
             cmd.append("--skip_if_exists")
+
+        # A stale request from a previous run would fire immediately.
+        try:
+            (Path(output or Path(dataset) / "output") / SNAPSHOT_FLAG).unlink()
+        except OSError:
+            pass
 
         r.log(f"\nTraining started. Total iterations: coarse "
               f"{cfg['coarse_iterations']:,} + fine {cfg['iterations']:,}", "head")
@@ -2219,6 +2514,26 @@ class App(tk.Tk):
             self.after(1000, self._tick_elapsed)
         elif not self.busy:
             self.train_start = None
+
+    def _save_snapshot(self):
+        """
+        Ask the running trainer for a .ply of the current iteration. Training
+        polls for this file once per iteration and deletes it after saving, so
+        the GUI never touches the model itself.
+        """
+        out = self.current_output_dir
+        if not out:
+            messagebox.showinfo(APP_NAME, "No training run is active.")
+            return
+        flag = Path(out) / SNAPSHOT_FLAG
+        try:
+            Path(out).mkdir(parents=True, exist_ok=True)
+            flag.write_text("", encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Could not request a snapshot: {exc}")
+            return
+        self._log_line(("ok", "Snapshot requested - the trainer will write "
+                              "snapshot_iteration_<N>.ply at the next iteration."))
 
     def _open_output(self):
         target = self.output_var.get().strip() or (
@@ -2263,7 +2578,7 @@ class App(tk.Tk):
                         self._maybe_progress(str(payload))
         except queue.Empty:
             pass
-        self.after(60, self._drain_log)
+        self._drain_job = self.after(60, self._drain_log)
 
     def _maybe_progress(self, line):
         """Pick training progress out of the tqdm bar."""
@@ -2282,6 +2597,14 @@ class App(tk.Tk):
                 return
             self.runner.stop()
         self._save_settings()
+        # Stop the polling loop, or it fires against a destroyed widget.
+        for job in (getattr(self, "_drain_job", None),
+                    getattr(self, "_validate_job", None)):
+            if job is not None:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
         self.destroy()
 
 

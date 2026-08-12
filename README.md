@@ -64,6 +64,36 @@ converting would silently corrupt the result.
 **3. Parameters** — every knob that matters, grouped and explained. Values are
 merged over the paper defaults and written to `repo/configs/lod_trainer.json`.
 
+Three things there are worth knowing:
+
+- **Max image width** controls training resolution (upstream's `-r`). `-1`
+  downscales anything wider than 1600px to 1600; any value above 8 is the width
+  in pixels. Careful: `1`, `2`, `4` and `8` mean *divide the original width by
+  this* rather than "set the width" — an upstream quirk, not a typo.
+- **Cache sizes are in GB**, not Gaussian counts. The field shows the count it
+  works out to as you type. The conversion follows the model layout — 14 floats
+  per Gaussian plus 3 channels of SH coefficients, all float32 — so it changes
+  with SH degree: 92 bytes at degree 1, 236 at degree 3. Worth noting the paper
+  default of 22M Gaussians is only **1.88 GB** at degree 1, so a 24 GB card has
+  far more headroom than the default uses.
+- **Presets are saveable.** *Save as...* stores everything currently set,
+  including image width, under your own name; *Delete* removes it. Your presets
+  sit alongside the built-in ones in the dropdown and persist in
+  `settings.json`.
+
+## Saving mid-run
+
+**Save .ply now** on the Train tab lights up while training and writes
+`snapshot_iteration_<N>.ply` into the output folder at the next iteration —
+useful for checking progress without waiting for the run to finish, or for
+salvaging something from a run you're about to stop.
+
+It works by dropping a flag file that the trainer picks up on its next pass, so
+the GUI never touches the model while it is being optimised. A snapshot that
+fails is caught and logged rather than taking the run down with it — worth
+knowing because upstream's `save_ply` hardcodes a 3×3 SH reshape and only
+succeeds at **SH degree 1**.
+
 Settings persist in `settings.json` between sessions.
 
 ## Expected dataset layout
